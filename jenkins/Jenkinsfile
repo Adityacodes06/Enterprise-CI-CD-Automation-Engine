@@ -1,0 +1,122 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        APP_NAME = 'cicd-automation'
+        DOCKER_REGISTRY = credentials('docker-registry-credentials')
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        disableConcurrentBuilds()
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build') {
+            steps {
+                dir('app') {
+                    sh '''
+                        python -m venv .venv
+                        . .venv/bin/activate || . .venv/Scripts/activate
+                        pip install --upgrade pip
+                        pip install -r requirements.txt
+                        pip install -e .
+                    '''
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                dir('app') {
+                    sh '''
+                        . .venv/bin/activate || . .venv/Scripts/activate
+                        pip install pytest pytest-cov
+                        pytest tests/ -v --junitxml=junit.xml --cov=src --cov-report=xml --cov-report=html --cov-report=term --cov-fail-under=95
+                    '''
+                }
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'app/junit.xml'
+                    publishHTML target: [
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'app/htmlcov',
+                        reportFiles: 'index.html',
+                        reportName: 'Coverage Report'
+                    ]
+                }
+            }
+        }
+
+        stage('Package') {
+            steps {
+                dir('app') {
+                    sh '''
+                        . .venv/bin/activate || . .venv/Scripts/activate
+                        python setup.py sdist bdist_wheel
+                    '''
+                }
+                archiveArtifacts artifacts: 'app/dist/*', fingerprint: true
+            }
+        }
+
+        stage('Build Docker Image') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    def version = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.DOCKER_TAG = "latest-${version}"
+                }
+                sh '''
+                    docker build -t ${APP_NAME}:${DOCKER_TAG} app/
+                    docker tag ${APP_NAME}:${DOCKER_TAG} ${APP_NAME}:blue
+                '''
+            }
+        }
+
+        stage('Blue-Green Deployment') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    def deployResult = sh(
+                        script: '''
+                            cd scripts
+                            ./blue-green-deploy.sh ${WORKSPACE} ${APP_NAME} ${DOCKER_TAG}
+                        ''',
+                        returnStatus: true
+                    )
+                    if (deployResult != 0) {
+                        error('Blue-green deployment failed')
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Pipeline completed successfully'
+        }
+        failure {
+            echo 'Pipeline failed'
+        }
+        always {
+            cleanWs(deleteDirs: true, patterns: [[pattern: '.venv', type: 'INCLUDE']])
+        }
+    }
+}
